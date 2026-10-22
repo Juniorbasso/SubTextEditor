@@ -897,6 +897,7 @@ class MainWindow(QMainWindow):
 
         self.create_actions()
         self.create_menus()
+        QApplication.clipboard().dataChanged.connect(self.update_edit_actions)
         self.apply_application_theme()
         keymap_path = self.user_package_dir / "Default.sublime-keymap"
         if keymap_path.is_file():

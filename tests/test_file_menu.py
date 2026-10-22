@@ -321,5 +321,245 @@ class FileMenuBehaviorTests(unittest.TestCase):
         self.assertFalse(self.window.isVisible())
 
 
+class EditMenuBehaviorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_home = tempfile.TemporaryDirectory(dir=_test_home.name)
+        self.addCleanup(self.temp_home.cleanup)
+        self.window = subtext_app.MainWindow([], start_new=True)
+        self.window.settings.clear()
+        self.window.show()
+        application.processEvents()
+
+    def tearDown(self) -> None:
+        self.window.close()
+        application.clipboard().clear()
+        application.processEvents()
+
+    def edit_menu(self):
+        return self.window.menuBar().actions()[1].menu()
+
+    def submenu(self, parent, label: str):
+        return next(action.menu() for action in parent.actions() if action.text() == label)
+
+    def action(self, parent, label: str):
+        return next(action for action in parent.actions() if action.text() == label)
+
+    @staticmethod
+    def select_all(editor) -> None:
+        editor.selectAll()
+        application.processEvents()
+
+    def test_undo_and_redo_restore_edits(self) -> None:
+        editor = self.window.current_editor()
+        editor.setPlainText("base")
+        cursor = editor.textCursor()
+        cursor.movePosition(subtext_app.QTextCursor.MoveOperation.End)
+        editor.setTextCursor(cursor)
+        editor.insertPlainText(" changed")
+
+        self.action(self.edit_menu(), "Undo").trigger()
+        self.assertEqual(editor.toPlainText(), "base")
+        self.action(self.edit_menu(), "Redo").trigger()
+        self.assertEqual(editor.toPlainText(), "base changed")
+
+    def test_copy_cut_and_paste_work_through_menu(self) -> None:
+        editor = self.window.current_editor()
+        editor.setPlainText("clipboard text")
+        self.select_all(editor)
+
+        self.action(self.edit_menu(), "Copy").trigger()
+        self.assertEqual(application.clipboard().text(), "clipboard text")
+        self.action(self.edit_menu(), "Cut").trigger()
+        self.assertEqual(editor.toPlainText(), "")
+        self.action(self.edit_menu(), "Paste").trigger()
+        self.assertEqual(editor.toPlainText(), "clipboard text")
+
+    def test_copy_as_html_copies_the_selected_text(self) -> None:
+        editor = self.window.current_editor()
+        editor.setPlainText("selected html")
+        self.select_all(editor)
+
+        self.action(self.edit_menu(), "Copy as HTML").trigger()
+
+        # Offscreen Qt exposes the selected text as plain text for stable tests.
+        self.assertEqual(application.clipboard().text(), "selected html")
+
+    def test_paste_and_indent_indents_continuation_lines(self) -> None:
+        editor = self.window.current_editor()
+        editor.setPlainText("    existing\n    ")
+        cursor = editor.textCursor()
+        cursor.movePosition(subtext_app.QTextCursor.MoveOperation.End)
+        editor.setTextCursor(cursor)
+        application.clipboard().setText("alpha\nbeta")
+        application.processEvents()
+        paste_indent = self.action(self.edit_menu(), "Paste and Indent")
+        self.assertTrue(paste_indent.isEnabled())
+
+        paste_indent.trigger()
+
+        self.assertEqual(editor.toPlainText(), "    existing\n    alpha\n    beta")
+
+    def test_paste_from_history_inserts_the_selected_entry(self) -> None:
+        editor = self.window.current_editor()
+        editor.setPlainText("start ")
+        cursor = editor.textCursor()
+        cursor.movePosition(subtext_app.QTextCursor.MoveOperation.End)
+        editor.setTextCursor(cursor)
+        self.window.clipboard_history = ["from history"]
+        history_menu = self.submenu(self.edit_menu(), "Paste from History")
+        history_menu.aboutToShow.emit()
+
+        self.action(history_menu, "from history").trigger()
+
+        self.assertEqual(editor.toPlainText(), "start from history")
+
+    def test_line_indent_unindent_and_reindent(self) -> None:
+        editor = self.window.current_editor()
+        line_menu = self.submenu(self.edit_menu(), "Line")
+        editor.setPlainText("first\nsecond")
+        self.select_all(editor)
+        self.action(line_menu, "Indent").trigger()
+        self.assertEqual(editor.toPlainText(), "    first\n    second")
+
+        self.select_all(editor)
+        self.action(line_menu, "Unindent").trigger()
+        self.assertEqual(editor.toPlainText(), "first\nsecond")
+
+        editor.setPlainText("\tfirst\n\tsecond")
+        self.select_all(editor)
+        self.action(line_menu, "Reindent").trigger()
+        self.assertEqual(editor.toPlainText(), "    first\n    second")
+
+    def test_line_swap_duplicate_delete_and_join(self) -> None:
+        editor = self.window.current_editor()
+        line_menu = self.submenu(self.edit_menu(), "Line")
+        editor.setPlainText("one\ntwo\nthree")
+        cursor = editor.textCursor()
+        cursor.setPosition(editor.document().findBlockByNumber(1).position())
+        editor.setTextCursor(cursor)
+        self.action(line_menu, "Swap Line Up").trigger()
+        self.assertEqual(editor.toPlainText(), "two\none\nthree")
+
+        editor.setPlainText("one\ntwo")
+        self.action(line_menu, "Duplicate Line").trigger()
+        self.assertEqual(editor.toPlainText(), "one\none\ntwo")
+        cursor = editor.textCursor()
+        cursor.setPosition(0)
+        editor.setTextCursor(cursor)
+        self.action(line_menu, "Delete Line").trigger()
+        self.assertEqual(editor.toPlainText(), "one\ntwo")
+
+        editor.setPlainText("one\ntwo")
+        self.select_all(editor)
+        self.action(line_menu, "Join Lines").trigger()
+        self.assertEqual(editor.toPlainText(), "one two")
+
+    def test_comment_submenu_toggles_line_and_block_comments(self) -> None:
+        editor = self.window.current_editor()
+        comment_menu = self.submenu(self.edit_menu(), "Comment")
+        editor.setProperty("displayName", "sample.py")
+        editor.setPlainText("print('hello')\n    value = 1")
+        self.select_all(editor)
+        self.window.update_edit_actions()
+
+        self.action(comment_menu, "Toggle Comment").trigger()
+        self.assertEqual(editor.toPlainText(), "# print('hello')\n    # value = 1")
+        self.select_all(editor)
+        self.action(comment_menu, "Toggle Comment").trigger()
+        self.assertEqual(editor.toPlainText(), "print('hello')\n    value = 1")
+
+        editor.setProperty("displayName", "sample.js")
+        editor.setPlainText("const x = 1;")
+        self.select_all(editor)
+        self.action(comment_menu, "Toggle Block Comment").trigger()
+        self.assertEqual(editor.toPlainText(), "/*const x = 1;*/")
+
+    def test_text_submenu_edits_line_edges_and_transposes(self) -> None:
+        editor = self.window.current_editor()
+        text_menu = self.submenu(self.edit_menu(), "Text")
+        editor.setPlainText("hello world")
+        cursor = editor.textCursor()
+        cursor.setPosition(5)
+        editor.setTextCursor(cursor)
+        self.action(text_menu, "Delete to End").trigger()
+        self.assertEqual(editor.toPlainText(), "hello")
+
+        editor.setPlainText("hello")
+        cursor = editor.textCursor()
+        cursor.setPosition(2)
+        editor.setTextCursor(cursor)
+        self.action(text_menu, "Delete to Beginning").trigger()
+        self.assertEqual(editor.toPlainText(), "llo")
+
+        editor.setPlainText("ab")
+        cursor = editor.textCursor()
+        cursor.setPosition(2)
+        editor.setTextCursor(cursor)
+        self.action(text_menu, "Transpose").trigger()
+        self.assertEqual(editor.toPlainText(), "ba")
+
+    def test_convert_case_submenu_transforms_line_or_selection(self) -> None:
+        editor = self.window.current_editor()
+        convert_menu = self.submenu(self.edit_menu(), "Convert Case")
+        cases = (
+            ("Title Case", "hello world", "Hello World"),
+            ("Upper Case", "hello world", "HELLO WORLD"),
+            ("Lower Case", "Hello WORLD", "hello world"),
+            ("Swap Case", "Hello World", "hELLO wORLD"),
+            ("lowerCamelCase", "hello world", "helloWorld"),
+            ("UpperCamelCase", "hello world", "HelloWorld"),
+            ("snake_case", "helloWorld", "hello_world"),
+            ("kebab-case", "helloWorld", "hello-world"),
+        )
+        for label, source, expected in cases:
+            with self.subTest(command=label):
+                editor.setPlainText(source)
+                self.action(convert_menu, label).trigger()
+                self.assertEqual(editor.toPlainText(), expected)
+
+    def test_wrap_submenu_wraps_paragraph_to_selected_width(self) -> None:
+        editor = self.window.current_editor()
+        source = " ".join(["word"] * 30)
+        editor.setPlainText(source)
+        wrap_menu = self.submenu(self.edit_menu(), "Wrap")
+
+        self.action(wrap_menu, "Wrap paragraph at 70 characters").trigger()
+
+        self.assertEqual(" ".join(editor.toPlainText().split()), source)
+        self.assertLessEqual(max(map(len, editor.toPlainText().splitlines())), 70)
+
+    def test_sort_and_permute_lines(self) -> None:
+        editor = self.window.current_editor()
+        editor.setPlainText("b\nB\na")
+        self.select_all(editor)
+        self.action(self.edit_menu(), "Sort Lines").trigger()
+        self.assertEqual(editor.toPlainText(), "a\nb\nB")
+
+        editor.setPlainText("b\nB\na")
+        self.select_all(editor)
+        self.action(self.edit_menu(), "Sort Lines (Case Sensitive)").trigger()
+        self.assertEqual(editor.toPlainText(), "B\na\nb")
+
+        editor.setPlainText("a\nb\nc")
+        self.select_all(editor)
+        reverse_menu = self.submenu(self.edit_menu(), "Permute Lines")
+        self.action(reverse_menu, "Reverse").trigger()
+        self.assertEqual(editor.toPlainText(), "c\nb\na")
+
+        editor.setPlainText("a\nb\na")
+        self.select_all(editor)
+        self.action(reverse_menu, "Unique").trigger()
+        self.assertEqual(editor.toPlainText(), "a\nb")
+
+    def test_unimplemented_edit_groups_are_explicitly_disabled(self) -> None:
+        edit_menu = self.edit_menu()
+        undo_selection = self.submenu(edit_menu, "Undo Selection")
+        self.assertTrue(all(not action.isEnabled() for action in undo_selection.actions()))
+        for label in ("Tag", "Mark", "Code Folding", "Permute Selections"):
+            with self.subTest(menu=label):
+                self.assertFalse(self.submenu(edit_menu, label).isEnabled())
+        self.assertFalse(self.action(edit_menu, "Show Completions").isEnabled())
+
+
 if __name__ == "__main__":
     unittest.main()
