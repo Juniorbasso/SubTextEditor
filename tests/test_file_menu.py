@@ -440,6 +440,13 @@ class EditMenuBehaviorTests(unittest.TestCase):
         self.action(line_menu, "Swap Line Up").trigger()
         self.assertEqual(editor.toPlainText(), "two\none\nthree")
 
+        editor.setPlainText("one\ntwo\nthree")
+        cursor = editor.textCursor()
+        cursor.setPosition(editor.document().findBlockByNumber(0).position())
+        editor.setTextCursor(cursor)
+        self.action(line_menu, "Swap Line Down").trigger()
+        self.assertEqual(editor.toPlainText(), "two\none\nthree")
+
         editor.setPlainText("one\ntwo")
         self.action(line_menu, "Duplicate Line").trigger()
         self.assertEqual(editor.toPlainText(), "one\none\ntwo")
@@ -491,12 +498,40 @@ class EditMenuBehaviorTests(unittest.TestCase):
         self.action(text_menu, "Delete to Beginning").trigger()
         self.assertEqual(editor.toPlainText(), "llo")
 
+        editor.setPlainText("hello world")
+        cursor = editor.textCursor()
+        cursor.setPosition(0)
+        editor.setTextCursor(cursor)
+        self.action(text_menu, "Delete Word Forward").trigger()
+        self.assertEqual(editor.toPlainText(), "world")
+
+        editor.setPlainText("hello world")
+        cursor = editor.textCursor()
+        cursor.movePosition(subtext_app.QTextCursor.MoveOperation.End)
+        editor.setTextCursor(cursor)
+        self.action(text_menu, "Delete Word Backward").trigger()
+        self.assertEqual(editor.toPlainText(), "hello ")
+
         editor.setPlainText("ab")
         cursor = editor.textCursor()
         cursor.setPosition(2)
         editor.setTextCursor(cursor)
         self.action(text_menu, "Transpose").trigger()
         self.assertEqual(editor.toPlainText(), "ba")
+
+        editor.setPlainText("alpha")
+        cursor = editor.textCursor()
+        cursor.setPosition(0)
+        editor.setTextCursor(cursor)
+        self.action(text_menu, "Insert Line Before").trigger()
+        self.assertEqual(editor.toPlainText(), "\nalpha")
+
+        editor.setPlainText("alpha")
+        cursor = editor.textCursor()
+        cursor.movePosition(subtext_app.QTextCursor.MoveOperation.End)
+        editor.setTextCursor(cursor)
+        self.action(text_menu, "Insert Line After").trigger()
+        self.assertEqual(editor.toPlainText(), "alpha\n")
 
     def test_convert_case_submenu_transforms_line_or_selection(self) -> None:
         editor = self.window.current_editor()
@@ -520,13 +555,22 @@ class EditMenuBehaviorTests(unittest.TestCase):
     def test_wrap_submenu_wraps_paragraph_to_selected_width(self) -> None:
         editor = self.window.current_editor()
         source = " ".join(["word"] * 30)
-        editor.setPlainText(source)
         wrap_menu = self.submenu(self.edit_menu(), "Wrap")
 
-        self.action(wrap_menu, "Wrap paragraph at 70 characters").trigger()
-
-        self.assertEqual(" ".join(editor.toPlainText().split()), source)
-        self.assertLessEqual(max(map(len, editor.toPlainText().splitlines())), 70)
+        for label, width in (
+            ("Wrap Paragraph", 80),
+            ("Wrap paragraph at 70 characters", 70),
+            ("Wrap paragraph at 72 characters", 72),
+            ("Wrap paragraph at 78 characters", 78),
+            ("Wrap paragraph at 80 characters", 80),
+            ("Wrap paragraph at 100 characters", 100),
+            ("Wrap paragraph at 120 characters", 120),
+        ):
+            with self.subTest(command=label):
+                editor.setPlainText(source)
+                self.action(wrap_menu, label).trigger()
+                self.assertEqual(" ".join(editor.toPlainText().split()), source)
+                self.assertLessEqual(max(map(len, editor.toPlainText().splitlines())), width)
 
     def test_sort_and_permute_lines(self) -> None:
         editor = self.window.current_editor()
@@ -550,6 +594,12 @@ class EditMenuBehaviorTests(unittest.TestCase):
         self.select_all(editor)
         self.action(reverse_menu, "Unique").trigger()
         self.assertEqual(editor.toPlainText(), "a\nb")
+
+        editor.setPlainText("a\nb\nc")
+        self.select_all(editor)
+        with patch.object(subtext_app.random, "shuffle", side_effect=lambda lines: lines.reverse()):
+            self.action(reverse_menu, "Shuffle").trigger()
+        self.assertEqual(editor.toPlainText(), "c\nb\na")
 
     def test_unimplemented_edit_groups_are_explicitly_disabled(self) -> None:
         edit_menu = self.edit_menu()
