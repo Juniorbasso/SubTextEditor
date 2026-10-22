@@ -64,6 +64,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QPlainTextEdit,
     QPushButton,
     QStatusBar,
@@ -145,10 +146,13 @@ class PythonHighlighter(QSyntaxHighlighter):
 
 class CodeEditor(QPlainTextEdit):
     focused = Signal()
+    multiSelectionsChanged = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.multi_selection_ranges: list[tuple[int, int]] = []
+        self.folded_ranges: dict[int, tuple[int, int]] = {}
+        self.foldable_ranges_cache: dict[int, tuple[int, int]] | None = None
         self.mouse_binding_handler = None
         self.line_number_area = LineNumberArea(self)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
@@ -197,9 +201,12 @@ class CodeEditor(QPlainTextEdit):
         super().setPlainText(text)
 
     def clear_multi_selections(self) -> None:
+        had_multi_selections = bool(self.multi_selection_ranges)
         self.multi_selection_ranges = []
         if hasattr(self, "document"):
             self.setExtraSelections([])
+        if had_multi_selections:
+            self.multiSelectionsChanged.emit()
 
     def set_multi_selections(
         self, ranges: list[tuple[int, int]], primary_index: int = -1
@@ -236,6 +243,7 @@ class CodeEditor(QPlainTextEdit):
             self.python_to_qt_position(text, primary[1]), QTextCursor.MoveMode.KeepAnchor
         )
         QPlainTextEdit.setTextCursor(self, cursor)
+        self.multiSelectionsChanged.emit()
 
     def replace_multi_selections(self, replacement: str | list[str], *, cut: bool = False) -> None:
         text = self.toPlainText()
@@ -627,6 +635,18 @@ class MainWindow(QMainWindow):
         self.project_definition: dict = {}
         self.navigation_back: list[tuple[CodeEditor, int, int]] = []
         self.navigation_forward: list[tuple[CodeEditor, int, int]] = []
+        self.selection_history: dict[CodeEditor, dict[str, object]] = {}
+        self.selected_tab_editors: set[CodeEditor] = set()
+        self.selection_menu_actions: dict[str, QAction] = {}
+        self.completion_menu: QMenu | None = None
+        self.mark_positions: dict[CodeEditor, QTextCursor] = {}
+        self.yank_buffer: dict[CodeEditor, str] = {}
+        self.tag_actions: dict[str, QAction] = {}
+        self.mark_actions: dict[str, QAction] = {}
+        self.folding_actions: dict[str, QAction] = {}
+        self.soft_undo_action: QAction | None = None
+        self.soft_redo_action: QAction | None = None
+        self.permute_selection_actions: dict[str, QAction] = {}
         self.tab_size = 4
         self._menu_hidden = False
         self._tabs_hidden = False
@@ -1213,6 +1233,35 @@ class MainWindow(QMainWindow):
         self.action_add_next_line = self.make_action(
             "Add Next Line", "Alt+Shift+Down", lambda: self.add_line_to_selection(1)
         )
+        self.action_close_tag = self.make_action("Close Tag", "", self.close_tag)
+        self.action_expand_tag = self.make_action(
+            "Expand Selection to Tag", "", self.expand_selection_to_tag
+        )
+        self.action_wrap_tag = self.make_action(
+            "Wrap Selection With Tag", "", self.wrap_selection_with_tag
+        )
+        self.action_set_mark = self.make_action("Set Mark", "", self.set_mark)
+        self.action_select_to_mark = self.make_action("Select to Mark", "", self.select_to_mark)
+        self.action_delete_to_mark = self.make_action("Delete to Mark", "", self.delete_to_mark)
+        self.action_swap_with_mark = self.make_action("Swap with Mark", "", self.swap_with_mark)
+        self.action_clear_mark = self.make_action("Clear Mark", "", self.clear_mark)
+        self.action_yank = self.make_action("Yank", "", self.yank_text)
+        self.action_fold = self.make_action("Fold", "", self.fold_at_cursor)
+        self.action_unfold = self.make_action("Unfold", "", self.unfold_at_cursor)
+        self.action_unfold_all = self.make_action("Unfold All", "", self.unfold_all)
+        self.action_fold_all = self.make_action("Fold All", "", self.fold_all)
+        self.action_permute_selection_sort = self.make_action(
+            "Sort", "", lambda: self.permute_selections("sort")
+        )
+        self.action_permute_selection_reverse = self.make_action(
+            "Reverse", "", lambda: self.permute_selections("reverse")
+        )
+        self.action_permute_selection_unique = self.make_action(
+            "Unique", "", lambda: self.permute_selections("unique")
+        )
+        self.action_permute_selection_shuffle = self.make_action(
+            "Shuffle", "", lambda: self.permute_selections("shuffle")
+        )
         self.action_copy_html = self.make_action("Copy as HTML", "", self.copy_as_html)
         self.action_paste_indent = self.make_action(
             "Paste and Indent", "Ctrl+Shift+V", self.paste_and_indent
@@ -1394,9 +1443,10 @@ class MainWindow(QMainWindow):
         menu.addAction(self.action_undo)
         menu.addAction(self.action_redo)
         undo_selection_menu = menu.addMenu("Undo Selection")
-        for label in ("Soft Undo", "Soft Redo"):
-            action = undo_selection_menu.addAction(label)
-            action.setEnabled(False)
+        self.soft_undo_action = undo_selection_menu.addAction("Soft Undo")
+        self.soft_undo_action.triggered.connect(lambda: self.soft_undo_selection(False))
+        self.soft_redo_action = undo_selection_menu.addAction("Soft Redo")
+        self.soft_redo_action.triggered.connect(lambda: self.soft_undo_selection(True))
         menu.addSeparator()
         for action in (
             self.action_cut,
@@ -1436,21 +1486,46 @@ class MainWindow(QMainWindow):
             self.action_transpose,
         ):
             text_menu.addAction(action)
-        self.add_disabled_submenu(
-            menu,
-            "Tag",
-            ("Close Tag", "Expand Selection to Tag", "Wrap Selection With Tag"),
-        )
-        self.add_disabled_submenu(
-            menu,
-            "Mark",
-            ("Set Mark", "Select to Mark", "Delete to Mark", "Swap with Mark", "Clear Mark", "Yank"),
-        )
-        self.add_disabled_submenu(
-            menu,
-            "Code Folding",
-            ("Fold", "Unfold", "Unfold All", "Fold All"),
-        )
+        tag_menu = menu.addMenu("Tag")
+        for action in (self.action_close_tag, self.action_expand_tag, self.action_wrap_tag):
+            tag_menu.addAction(action)
+        self.tag_actions = {
+            "Close Tag": self.action_close_tag,
+            "Expand Selection to Tag": self.action_expand_tag,
+            "Wrap Selection With Tag": self.action_wrap_tag,
+        }
+        mark_menu = menu.addMenu("Mark")
+        for action in (
+            self.action_set_mark,
+            self.action_select_to_mark,
+            self.action_delete_to_mark,
+            self.action_swap_with_mark,
+            self.action_clear_mark,
+            self.action_yank,
+        ):
+            mark_menu.addAction(action)
+        self.mark_actions = {
+            "Set Mark": self.action_set_mark,
+            "Select to Mark": self.action_select_to_mark,
+            "Delete to Mark": self.action_delete_to_mark,
+            "Swap with Mark": self.action_swap_with_mark,
+            "Clear Mark": self.action_clear_mark,
+            "Yank": self.action_yank,
+        }
+        folding_menu = menu.addMenu("Code Folding")
+        for action in (
+            self.action_fold,
+            self.action_unfold,
+            self.action_unfold_all,
+            self.action_fold_all,
+        ):
+            folding_menu.addAction(action)
+        self.folding_actions = {
+            "Fold": self.action_fold,
+            "Unfold": self.action_unfold,
+            "Unfold All": self.action_unfold_all,
+            "Fold All": self.action_fold_all,
+        }
         convert_menu = menu.addMenu("Convert Case")
         for action in (
             self.action_title_case,
@@ -1470,7 +1545,6 @@ class MainWindow(QMainWindow):
                 f"Wrap paragraph at {width} characters",
                 lambda _checked=False, value=width: self.wrap_text(value),
             )
-        self.action_show_completions.setEnabled(False)
         menu.addAction(self.action_show_completions)
         menu.addSeparator()
         menu.addAction(self.action_sort_lines)
@@ -1485,11 +1559,20 @@ class MainWindow(QMainWindow):
                 label,
                 lambda _checked=False, value=operation: self.permute_lines(value),
             )
-        self.add_disabled_submenu(
-            menu,
-            "Permute Selections",
-            ("Sort", "Reverse", "Unique", "Shuffle"),
-        )
+        permute_selection_menu = menu.addMenu("Permute Selections")
+        for action in (
+            self.action_permute_selection_sort,
+            self.action_permute_selection_reverse,
+            self.action_permute_selection_unique,
+            self.action_permute_selection_shuffle,
+        ):
+            permute_selection_menu.addAction(action)
+        self.permute_selection_actions = {
+            "Sort": self.action_permute_selection_sort,
+            "Reverse": self.action_permute_selection_reverse,
+            "Unique": self.action_permute_selection_unique,
+            "Shuffle": self.action_permute_selection_shuffle,
+        }
 
         menu = self.menuBar().addMenu("&Selection")
         menu.addAction(self.action_split_selection_lines)
@@ -1512,34 +1595,19 @@ class MainWindow(QMainWindow):
         menu.addAction(self.action_add_previous_line)
         menu.addAction(self.action_add_next_line)
         menu.addSeparator()
-        self.add_disabled_submenu(
-            menu,
-            "Tab Selection",
-            (
-                "Unselect Others",
-                "Unselect to Left",
-                "Unselect to Right",
-                "Unselect Current",
-                "Select to Left",
-                "Select to Right",
-                "Focus to Left",
-                "Focus to Right",
-                "Focus Selected Tab 1",
-                "Focus Selected Tab 2",
-                "Focus Selected Tab 3",
-                "Focus Selected Tab 4",
-                "Focus Selected Tab 5",
-                "Focus Selected Tab 6",
-                "Focus Selected Tab 7",
-                "Focus Selected Tab 8",
-                "Focus Selected Tab 9",
-                "Focus Selected Tab 10",
-            ),
+        tab_selection_menu = menu.addMenu("Tab Selection")
+        tab_labels = (
+            "Unselect Others", "Unselect to Left", "Unselect to Right", "Unselect Current",
+            "Select to Left", "Select to Right", "Focus to Left", "Focus to Right",
+            *(f"Focus Selected Tab {index}" for index in range(1, 11)),
         )
-        self.action_split_selection_lines.setEnabled(False)
-        self.action_expand_scope.setEnabled(False)
-        self.action_add_previous_line.setEnabled(False)
-        self.action_add_next_line.setEnabled(False)
+        self.selection_menu_actions = {}
+        for label in tab_labels:
+            action = tab_selection_menu.addAction(label)
+            action.triggered.connect(
+                lambda _checked=False, command=label: self.handle_tab_selection(command)
+            )
+            self.selection_menu_actions[label] = action
 
         menu = self.menuBar().addMenu("&Find")
         for action in (
@@ -2622,9 +2690,19 @@ class MainWindow(QMainWindow):
         editor.setProperty("displayName", name)
         editor.setProperty("lineEnding", "\n")
         editor.setProperty("fileEncoding", "utf-8")
+        self.selection_history[editor] = {
+            "current": (editor.textCursor().anchor(), editor.textCursor().position()),
+            "undo": [],
+            "redo": [],
+        }
+        editor.cursorPositionChanged.connect(
+            lambda target=editor: self.record_selection_state(target)
+        )
         editor.cursorPositionChanged.connect(self.update_cursor_position)
         editor.cursorPositionChanged.connect(self.update_edit_actions)
+        editor.cursorPositionChanged.connect(self.update_selection_actions)
         editor.cursorPositionChanged.connect(self.schedule_session_save)
+        editor.multiSelectionsChanged.connect(self.update_selection_actions)
         editor.focused.connect(self.activate_main_editor_group)
         editor.textChanged.connect(lambda target=editor: self.on_editor_text_changed(target))
         editor.document().undoAvailable.connect(self.update_edit_actions)
@@ -2639,6 +2717,8 @@ class MainWindow(QMainWindow):
         self.apply_syntax_highlighter(editor)
         index = self.tabs.addTab(editor, name)
         self.tabs.setCurrentIndex(index)
+        self.selected_tab_editors = {editor}
+        self.update_tab_selection_action_state()
         return editor
 
     def new_file(self) -> None:
@@ -2656,6 +2736,8 @@ class MainWindow(QMainWindow):
             self.session_save_timer.start()
 
     def on_editor_text_changed(self, editor: CodeEditor) -> None:
+        editor.foldable_ranges_cache = None
+        self.reset_code_folding(editor)
         self.update_tab_label(editor)
         self.schedule_session_save()
 
@@ -3202,7 +3284,13 @@ class MainWindow(QMainWindow):
                     self.update_edit_actions
                 )
                 self.split_editor.cursorPositionChanged.connect(
+                    self.update_selection_actions
+                )
+                self.split_editor.cursorPositionChanged.connect(
                     self.schedule_session_save
+                )
+                self.split_editor.multiSelectionsChanged.connect(
+                    self.update_selection_actions
                 )
                 self.split_editor.focused.connect(self.activate_split_editor_group)
                 self.editor_splitter.addWidget(self.split_editor)
@@ -3423,6 +3511,10 @@ class MainWindow(QMainWindow):
         if self.macro_recording and self.macro_editor is editor:
             self.toggle_macro_recording()
         self.highlighters.pop(editor, None)
+        self.selection_history.pop(editor, None)
+        self.mark_positions.pop(editor, None)
+        self.yank_buffer.pop(editor, None)
+        self.selected_tab_editors.discard(editor)
         self.navigation_back = [entry for entry in self.navigation_back if entry[0] is not editor]
         self.navigation_forward = [entry for entry in self.navigation_forward if entry[0] is not editor]
         self.tabs.removeTab(index)
@@ -3546,7 +3638,10 @@ class MainWindow(QMainWindow):
             getattr(editor, method)()
 
     def update_selection_actions(self) -> None:
-        available = self.current_editor() is not None
+        editor = self.current_editor()
+        available = editor is not None
+        has_selection = bool(editor and editor.textCursor().hasSelection())
+        has_multiple = bool(editor and editor.multi_selection_ranges)
         for action in (
             self.action_expand_smart,
             self.action_expand_line,
@@ -3554,27 +3649,461 @@ class MainWindow(QMainWindow):
             self.action_expand_word,
             self.action_expand_block,
             self.action_expand_paragraph,
+            self.action_expand_scope,
             self.action_expand_brackets,
             self.action_expand_indentation,
         ):
             action.setEnabled(available)
-        # These commands require multiple independent cursors or syntax scopes.
-        self.action_split_selection_lines.setEnabled(False)
-        self.action_single_selection.setEnabled(False)
-        self.action_expand_scope.setEnabled(False)
-        self.action_add_previous_line.setEnabled(False)
-        self.action_add_next_line.setEnabled(False)
+        self.action_split_selection_lines.setEnabled(available and (has_selection or has_multiple))
+        self.action_single_selection.setEnabled(available and has_multiple)
+        self.action_expand_scope.setEnabled(available)
+        cursor = editor.textCursor() if editor is not None else None
+        self.action_add_previous_line.setEnabled(
+            available and bool(cursor and cursor.blockNumber() > 0)
+        )
+        self.action_add_next_line.setEnabled(
+            available and bool(cursor and cursor.blockNumber() + 1 < editor.blockCount())
+        )
+        self.update_tab_selection_action_state()
+        self.update_edit_actions()
 
     def single_selection(self) -> None:
         editor = self.current_editor()
         if editor is None:
+            return
+        if editor.multi_selection_ranges:
+            primary = editor.multi_selection_ranges[-1]
+            self.set_python_selection(editor, *primary)
             return
         cursor = editor.textCursor()
         cursor.clearSelection()
         editor.setTextCursor(cursor)
 
     def split_selection_into_lines(self) -> None:
-        self.status.showMessage("Multiple selections are not available yet", 3000)
+        editor = self.current_editor()
+        if editor is None:
+            return
+        text = editor.toPlainText()
+        ranges = editor.multi_selection_ranges or []
+        cursor = editor.textCursor()
+        if cursor.hasSelection():
+            ranges.append(
+                (
+                    self.qt_to_python_position(text, min(cursor.anchor(), cursor.position())),
+                    self.qt_to_python_position(text, max(cursor.anchor(), cursor.position())),
+                )
+            )
+        split_ranges: list[tuple[int, int]] = []
+        for start, end in ranges:
+            if start == end:
+                continue
+            first = text.rfind("\n", 0, start) + 1
+            last_position = max(start, end - 1)
+            last_newline = text.find("\n", last_position)
+            last = len(text) if last_newline < 0 else last_newline
+            line_start = first
+            while line_start <= last:
+                newline = text.find("\n", line_start)
+                line_end = len(text) if newline < 0 or newline > last else newline
+                split_ranges.append((line_start, line_end))
+                if newline < 0 or newline > last:
+                    break
+                line_start = newline + 1
+        if split_ranges:
+            editor.set_multi_selections(split_ranges)
+            self.update_selection_actions()
+
+    def record_selection_state(self, editor: CodeEditor) -> None:
+        if editor.property("restoringSelection"):
+            return
+        history = self.selection_history.setdefault(
+            editor, {"current": (0, 0), "undo": [], "redo": []}
+        )
+        cursor = editor.textCursor()
+        state = (cursor.anchor(), cursor.position())
+        previous = history.get("current", state)
+        if state == previous:
+            return
+        history["undo"].append(previous)
+        history["current"] = state
+        history["redo"].clear()
+
+    def soft_undo_selection(self, redo: bool = False) -> None:
+        editor = self.current_editor()
+        if editor is None:
+            return
+        history = self.selection_history.setdefault(
+            editor, {"current": (0, 0), "undo": [], "redo": []}
+        )
+        source_key, target_key = ("redo", "undo") if redo else ("undo", "redo")
+        source = history[source_key]
+        if not source:
+            return
+        current = history.get("current", (0, 0))
+        target = source.pop()
+        history[target_key].append(current)
+        history["current"] = target
+        editor.setProperty("restoringSelection", True)
+        cursor = QTextCursor(editor.document())
+        cursor.setPosition(max(0, min(target[0], editor.document().characterCount() - 1)))
+        cursor.setPosition(
+            max(0, min(target[1], editor.document().characterCount() - 1)),
+            QTextCursor.MoveMode.KeepAnchor,
+        )
+        editor.setTextCursor(cursor)
+        editor.setProperty("restoringSelection", False)
+        self.update_edit_actions()
+
+    @staticmethod
+    def tag_pair_ranges(text: str) -> list[tuple[int, int, str]]:
+        token = re.compile(r"<(/?)([A-Za-z][\w:.-]*)\b(?:\"[^\"]*\"|'[^']*'|[^'\">])*?/?>")
+        stack: list[tuple[str, int, int, bool]] = []
+        result = []
+        for match in token.finditer(text):
+            closing, name = match.group(1), match.group(2)
+            whole = match.group(0)
+            if closing:
+                opening_index = next(
+                    (index for index in range(len(stack) - 1, -1, -1)
+                     if stack[index][0].casefold() == name.casefold()),
+                    None,
+                )
+                if opening_index is None:
+                    continue
+                open_name, start, _end, self_closing = stack[opening_index]
+                stack = stack[:opening_index]
+                if not self_closing:
+                    result.append((start, match.end(), open_name))
+            else:
+                self_closing = whole.rstrip().endswith("/>")
+                if not self_closing:
+                    stack.append((name, match.start(), match.end(), self_closing))
+        return result
+
+    def close_tag(self) -> None:
+        editor = self.current_editor()
+        if editor is None:
+            return
+        text, _start, _end, _forward, position = self.python_selection_range(editor)
+        opening = re.search(r"<([A-Za-z][\w:.-]*)\b[^<>]*>$", text[:position])
+        if opening is None or opening.group(0).rstrip().endswith("/>"):
+            return
+        editor.insertPlainText(f"</{opening.group(1)}>")
+
+    def expand_selection_to_tag(self) -> None:
+        editor = self.current_editor()
+        if editor is None:
+            return
+        text, start, end, forward, position = self.python_selection_range(editor)
+        point_start, point_end = (start, end) if start != end else (position, position)
+        candidates = [
+            (left, right)
+            for left, right, _name in self.tag_pair_ranges(text)
+            if left <= point_start and right >= point_end
+            and (left < start or right > end or start == end)
+        ]
+        if candidates:
+            self.set_python_selection(
+                editor, *min(candidates, key=lambda item: item[1] - item[0]), forward=forward
+            )
+
+    def wrap_selection_with_tag(self) -> None:
+        editor = self.current_editor()
+        if editor is None or not editor.textCursor().hasSelection():
+            return
+        name, accepted = QInputDialog.getText(self, "Wrap with Tag", "Tag name:")
+        name = name.strip()
+        if not accepted or not re.fullmatch(r"[A-Za-z][\w:.-]*", name):
+            return
+        text, start, end, forward, _position = self.python_selection_range(editor)
+        content = text[start:end]
+        replacement = f"<{name}>{content}</{name}>"
+        self.set_python_selection(editor, start, end, forward=True)
+        editor.insertPlainText(replacement)
+        self.set_python_selection(editor, start + len(name) + 2, start + len(name) + 2 + len(content), forward=forward)
+
+    def set_mark(self) -> None:
+        editor = self.current_editor()
+        if editor is not None:
+            mark = QTextCursor(editor.document())
+            mark.setPosition(editor.textCursor().position())
+            self.mark_positions[editor] = mark
+            self.update_edit_actions()
+
+    def select_to_mark(self) -> None:
+        editor = self.current_editor()
+        if editor is None or editor not in self.mark_positions:
+            return
+        text = editor.toPlainText()
+        mark = self.qt_to_python_position(text, self.mark_positions[editor].position())
+        cursor = self.qt_to_python_position(text, editor.textCursor().position())
+        self.set_python_selection(editor, min(mark, cursor), max(mark, cursor), forward=cursor >= mark)
+
+    def delete_to_mark(self) -> None:
+        editor = self.current_editor()
+        if editor is None or editor not in self.mark_positions:
+            return
+        self.select_to_mark()
+        cursor = editor.textCursor()
+        self.yank_buffer[editor] = cursor.selectedText().replace("\u2029", "\n")
+        cursor.removeSelectedText()
+        editor.setTextCursor(cursor)
+
+    def swap_with_mark(self) -> None:
+        editor = self.current_editor()
+        if editor is None or editor not in self.mark_positions:
+            return
+        text = editor.toPlainText()
+        cursor = self.qt_to_python_position(text, editor.textCursor().position())
+        mark = self.qt_to_python_position(text, self.mark_positions[editor].position())
+        marker = QTextCursor(editor.document())
+        marker.setPosition(self.python_to_qt_position(text, cursor))
+        self.mark_positions[editor] = marker
+        self.set_python_selection(editor, mark, mark)
+
+    def clear_mark(self) -> None:
+        editor = self.current_editor()
+        if editor is not None:
+            self.mark_positions.pop(editor, None)
+            self.update_edit_actions()
+
+    def yank_text(self) -> None:
+        editor = self.current_editor()
+        if editor is not None and self.yank_buffer.get(editor):
+            editor.insertPlainText(self.yank_buffer[editor])
+
+    def foldable_block_range(self, editor: CodeEditor, block_number: int) -> tuple[int, int] | None:
+        ranges = editor.foldable_ranges_cache
+        if ranges is None:
+            lines = editor.toPlainText().split("\n")
+            ranges = {}
+            stack: list[tuple[int, int]] = []
+            previous: tuple[int, int] | None = None
+            for index, line in enumerate(lines):
+                if not line.strip():
+                    continue
+                indentation = len(line) - len(line.lstrip(" \t"))
+                while stack and indentation <= stack[-1][1]:
+                    start, _parent_indent = stack.pop()
+                    ranges[start] = (start + 1, index)
+                if previous is not None and indentation > previous[1]:
+                    stack.append(previous)
+                previous = (index, indentation)
+            while stack:
+                start, _parent_indent = stack.pop()
+                ranges[start] = (start + 1, len(lines))
+            editor.foldable_ranges_cache = ranges
+        region = ranges.get(block_number)
+        return (block_number, region[1]) if region is not None else None
+
+    @staticmethod
+    def set_block_visibility(editor: CodeEditor, start: int, end: int, visible: bool) -> None:
+        block = editor.document().findBlockByNumber(start)
+        while block.isValid() and block.blockNumber() < end:
+            block.setVisible(visible)
+            block.setLineCount(max(1, block.layout().lineCount()) if visible else 0)
+            block = block.next()
+        editor.document().markContentsDirty(0, editor.document().characterCount())
+        editor.viewport().update()
+
+    def fold_at_cursor(self) -> None:
+        editor = self.current_editor()
+        if editor is None:
+            return
+        start = editor.textCursor().blockNumber()
+        region = self.foldable_block_range(editor, start)
+        if region is None:
+            return
+        _first, end = region
+        self.set_block_visibility(editor, start + 1, end, False)
+        editor.folded_ranges[start] = (start + 1, end)
+        self.update_edit_actions()
+
+    def unfold_at_cursor(self) -> None:
+        editor = self.current_editor()
+        if editor is None:
+            return
+        start = editor.textCursor().blockNumber()
+        region = editor.folded_ranges.pop(start, None)
+        if region is not None:
+            self.set_block_visibility(editor, region[0], region[1], True)
+        self.update_edit_actions()
+
+    def unfold_all(self) -> None:
+        editor = self.current_editor()
+        if editor is None:
+            return
+        self.set_block_visibility(editor, 0, editor.blockCount(), True)
+        editor.folded_ranges.clear()
+        self.update_edit_actions()
+
+    def fold_all(self) -> None:
+        editor = self.current_editor()
+        if editor is None:
+            return
+        self.unfold_all()
+        foldable = editor.foldable_ranges_cache or {}
+        for start, (_child_start, end) in foldable.items():
+            editor.folded_ranges[start] = (start + 1, end)
+            self.set_block_visibility(editor, start + 1, end, False)
+        self.update_edit_actions()
+
+    def reset_code_folding(self, editor: CodeEditor) -> None:
+        if editor.folded_ranges:
+            self.set_block_visibility(editor, 0, editor.blockCount(), True)
+            editor.folded_ranges.clear()
+
+    def permute_selections(self, operation: str) -> None:
+        editor = self.current_editor()
+        if editor is None:
+            return
+        text = editor.toPlainText()
+        ranges = list(editor.multi_selection_ranges)
+        if not ranges and editor.textCursor().hasSelection():
+            cursor = editor.textCursor()
+            ranges = [(
+                self.qt_to_python_position(text, min(cursor.anchor(), cursor.position())),
+                self.qt_to_python_position(text, max(cursor.anchor(), cursor.position())),
+            )]
+        if not ranges:
+            return
+        replacements = []
+        for start, end in ranges:
+            selected = text[start:end]
+            lines = selected.splitlines()
+            if operation == "sort":
+                lines = sorted(lines, key=lambda value: value.casefold())
+            elif operation == "reverse":
+                lines.reverse()
+            elif operation == "unique":
+                seen: set[str] = set()
+                lines = [line for line in lines if not (line.rstrip("\r\n") in seen or seen.add(line.rstrip("\r\n")))]
+            elif operation == "shuffle":
+                random.shuffle(lines)
+            replacement = "\n".join(lines)
+            if selected.endswith(("\n", "\r")) and lines:
+                replacement += "\n"
+            replacements.append(replacement)
+        if len(ranges) > 1:
+            editor.replace_multi_selections(replacements)
+        else:
+            start, end = ranges[0]
+            self.set_python_selection(editor, start, end)
+            editor.insertPlainText(replacements[0])
+
+    def handle_tab_selection(self, command: str) -> None:
+        count = self.tabs.count()
+        if count < 1:
+            return
+        current = self.tabs.currentIndex()
+        selected = {
+            index for index in range(count) if self.tabs.widget(index) in self.selected_tab_editors
+        }
+        if not selected:
+            selected = {current}
+        if command == "Unselect Others":
+            selected = {current}
+        elif command == "Unselect to Left":
+            selected = {index for index in selected if index >= current}
+        elif command == "Unselect to Right":
+            selected = {index for index in selected if index <= current}
+        elif command == "Unselect Current":
+            selected.discard(current)
+        elif command == "Select to Left":
+            selected.update(range(current))
+        elif command == "Select to Right":
+            selected.update(range(current + 1, count))
+        elif command in ("Focus to Left", "Focus to Right"):
+            ordered = sorted(selected)
+            if current not in ordered:
+                current = ordered[0] if command.endswith("Left") else ordered[-1]
+            elif command.endswith("Left"):
+                current = next((index for index in reversed(ordered) if index < current), current)
+            else:
+                current = next((index for index in ordered if index > current), current)
+            self.tabs.setCurrentIndex(current)
+        elif command.startswith("Focus Selected Tab "):
+            try:
+                ordinal = int(command.rsplit(" ", 1)[1]) - 1
+            except ValueError:
+                return
+            ordered = sorted(selected)
+            if 0 <= ordinal < len(ordered):
+                self.tabs.setCurrentIndex(ordered[ordinal])
+        self.selected_tab_editors = {
+            self.tabs.widget(index) for index in selected if 0 <= index < count
+        }
+        self.update_tab_selection_action_state()
+
+    def update_tab_selection_action_state(self) -> None:
+        if not self.selection_menu_actions:
+            return
+        count = self.tabs.count()
+        current = self.tabs.currentIndex()
+        selected = {
+            index for index in range(count) if self.tabs.widget(index) in self.selected_tab_editors
+        }
+        states = {
+            "Unselect Others": any(index != current for index in selected),
+            "Unselect to Left": any(index < current for index in selected),
+            "Unselect to Right": any(index > current for index in selected),
+            "Unselect Current": current in selected,
+            "Select to Left": current > 0,
+            "Select to Right": 0 <= current < count - 1,
+            "Focus to Left": any(index < current for index in selected),
+            "Focus to Right": any(index > current for index in selected),
+        }
+        for ordinal in range(1, 11):
+            states[f"Focus Selected Tab {ordinal}"] = len(selected) >= ordinal
+        for label, action in self.selection_menu_actions.items():
+            action.setEnabled(states.get(label, False))
+        for index in range(self.tabs.count()):
+            editor = self.tabs.widget(index)
+            color = QColor("#72c7f1") if editor in self.selected_tab_editors else QColor("#d8dee9")
+            self.tabs.tabBar().setTabTextColor(index, color)
+
+    def update_special_edit_actions(self, editor: CodeEditor | None) -> None:
+        if editor is None:
+            actions = [
+                *self.tag_actions.values(), *self.mark_actions.values(),
+                *self.folding_actions.values(), *self.permute_selection_actions.values(),
+            ]
+            for action in actions:
+                action.setEnabled(False)
+            if self.soft_undo_action is not None:
+                self.soft_undo_action.setEnabled(False)
+            if self.soft_redo_action is not None:
+                self.soft_redo_action.setEnabled(False)
+            return
+        text = editor.toPlainText()
+        cursor = editor.textCursor()
+        position = self.qt_to_python_position(text, cursor.position())
+        before = text[:position]
+        has_mark = editor in self.mark_positions
+        self.action_close_tag.setEnabled(
+            not cursor.hasSelection()
+            and bool(re.search(r"<[A-Za-z][\w:.-]*\b[^<>]*>$", before))
+        )
+        tag_ranges = self.tag_pair_ranges(text)
+        self.action_expand_tag.setEnabled(any(left <= position <= right for left, right, _ in tag_ranges))
+        self.action_wrap_tag.setEnabled(cursor.hasSelection())
+        for label in ("Select to Mark", "Delete to Mark", "Swap with Mark", "Clear Mark"):
+            self.mark_actions[label].setEnabled(has_mark)
+        self.action_set_mark.setEnabled(True)
+        self.action_yank.setEnabled(bool(self.yank_buffer.get(editor)))
+        block_number = cursor.blockNumber()
+        self.action_fold.setEnabled(self.foldable_block_range(editor, block_number) is not None)
+        self.action_unfold.setEnabled(block_number in editor.folded_ranges)
+        self.action_unfold_all.setEnabled(bool(editor.folded_ranges))
+        self.action_fold_all.setEnabled(bool(editor.foldable_ranges_cache or self.foldable_block_range(editor, 0)))
+        has_ranges = bool(editor.multi_selection_ranges or cursor.hasSelection())
+        for action in self.permute_selection_actions.values():
+            action.setEnabled(has_ranges)
+        history = self.selection_history.get(editor, {})
+        if self.soft_undo_action is not None:
+            self.soft_undo_action.setEnabled(bool(history.get("undo")))
+        if self.soft_redo_action is not None:
+            self.soft_redo_action.setEnabled(bool(history.get("redo")))
 
     @staticmethod
     def qt_to_python_position(text: str, position: int) -> int:
@@ -3801,20 +4330,64 @@ class MainWindow(QMainWindow):
                 return
             target = min(candidates, key=lambda candidate: candidate[1] - candidate[0])
         elif mode == "scope":
-            self.status.showMessage("Syntax scope selection is not available yet", 3000)
-            return
+            point = position if start == end else start
+            candidates = self.bracket_ranges(text)
+            candidates.extend(
+                (self.indentation_range(text, point), self.paragraph_range(text, point))
+            )
+            candidates.append(self.line_range(text, point))
+            candidates = [
+                candidate for candidate in candidates
+                if candidate[0] <= point
+                and candidate[1] >= (point if start == end else end)
+                and (candidate[0] < start or candidate[1] > end or start == end)
+            ]
+            if not candidates:
+                return
+            target = min(candidates, key=lambda candidate: candidate[1] - candidate[0])
         else:
             return
         self.set_python_selection(editor, *target, forward=forward)
 
     def add_line_to_selection(self, direction: int) -> None:
-        self.status.showMessage("Adding independent line cursors is not available yet", 3000)
-
-    def add_disabled_submenu(self, parent, title: str, labels: tuple[str, ...]) -> None:
-        submenu = parent.addMenu(title)
-        submenu.setEnabled(False)
-        for label in labels:
-            submenu.addAction(label).setEnabled(False)
+        editor = self.current_editor()
+        if editor is None or direction not in (-1, 1):
+            return
+        text = editor.toPlainText()
+        current_ranges = list(editor.multi_selection_ranges)
+        if not current_ranges:
+            cursor = editor.textCursor()
+            current_ranges = [(
+                self.qt_to_python_position(text, min(cursor.anchor(), cursor.position())),
+                self.qt_to_python_position(text, max(cursor.anchor(), cursor.position())),
+            )]
+        result = list(current_ranges)
+        for start, end in current_ranges:
+            line_start = text.rfind("\n", 0, start) + 1
+            target_start = line_start
+            for _ in range(abs(direction)):
+                if direction < 0:
+                    if target_start == 0:
+                        break
+                    target_start = text.rfind("\n", 0, target_start - 1) + 1
+                else:
+                    newline = text.find("\n", target_start)
+                    if newline < 0:
+                        target_start = -1
+                        break
+                    target_start = newline + 1
+            if target_start < 0:
+                continue
+            target_end = text.find("\n", target_start)
+            target_end = len(text) if target_end < 0 else target_end
+            start_column = start - line_start
+            end_column = max(start_column, end - line_start)
+            added_start = target_start + min(start_column, target_end - target_start)
+            added_end = target_start + min(end_column, target_end - target_start)
+            result.append((added_start, added_end))
+        if len(set(result)) > len(set(current_ranges)):
+            editor.set_multi_selections(result)
+            self.update_selection_actions()
 
     def update_edit_actions(self, *_args) -> None:
         editor = self.current_editor()
@@ -3829,8 +4402,10 @@ class MainWindow(QMainWindow):
                 self.action_paste_indent,
                 self.action_toggle_comment,
                 self.action_toggle_block_comment,
+                self.action_show_completions,
             ):
                 action.setEnabled(False)
+            self.update_special_edit_actions(None)
             return
 
         has_selection = editor.textCursor().hasSelection()
@@ -3843,9 +4418,11 @@ class MainWindow(QMainWindow):
         self.action_copy_html.setEnabled(has_selection)
         self.action_paste.setEnabled(has_clipboard_text)
         self.action_paste_indent.setEnabled(has_clipboard_text)
+        self.action_show_completions.setEnabled(True)
         _line_prefix, block_pair = self.comment_syntax(editor)
         self.action_toggle_comment.setEnabled(_line_prefix is not None or block_pair is not None)
         self.action_toggle_block_comment.setEnabled(block_pair is not None)
+        self.update_special_edit_actions(editor)
 
     @staticmethod
     def comment_syntax(editor: CodeEditor) -> tuple[str | None, tuple[str, str] | None]:
@@ -4314,7 +4891,51 @@ class MainWindow(QMainWindow):
         self.replace_block_range(editor, blocks[0], blocks[-1], transform(lines))
 
     def show_completions(self) -> None:
-        self.status.showMessage("Completions are not available in this editor yet", 3000)
+        editor = self.current_editor()
+        if editor is None:
+            return
+        text = editor.toPlainText()
+        position = self.qt_to_python_position(text, editor.textCursor().position())
+        prefix_match = re.search(r"[A-Za-z_][A-Za-z_0-9]*$", text[:position])
+        prefix = prefix_match.group(0) if prefix_match else ""
+        candidates = self.completion_candidates(text, prefix)
+        if not candidates:
+            self.status.showMessage("No completions available", 2000)
+            return
+        if self.completion_menu is not None:
+            self.completion_menu.close()
+            self.completion_menu.deleteLater()
+        menu = QMenu(self)
+        self.completion_menu = menu
+        for candidate in candidates[:30]:
+            action = menu.addAction(candidate)
+            action.triggered.connect(
+                lambda _checked=False, value=candidate, start=position - len(prefix):
+                    self.insert_completion(value, start)
+            )
+        menu.popup(editor.mapToGlobal(editor.cursorRect().bottomRight()))
+
+    @staticmethod
+    def completion_candidates(text: str, prefix: str = "") -> list[str]:
+        vocabulary = set(re.findall(r"\b[A-Za-z_][A-Za-z_0-9]*\b", text))
+        vocabulary.update(
+            "False None True and as assert async await break class continue def del elif else "
+            "except finally for from global if import in is lambda nonlocal not or pass raise "
+            "return try while with yield print len range str int float list dict set tuple open "
+            "super self __init__".split()
+        )
+        if prefix:
+            vocabulary = {word for word in vocabulary if word.startswith(prefix) and word != prefix}
+        return sorted(vocabulary, key=lambda word: (word.casefold(), word))
+
+    def insert_completion(self, completion: str, prefix_start: int) -> None:
+        editor = self.current_editor()
+        if editor is None:
+            return
+        text = editor.toPlainText()
+        position = self.qt_to_python_position(text, editor.textCursor().position())
+        self.set_python_selection(editor, max(0, prefix_start), position)
+        editor.insertPlainText(completion)
 
     def show_find_bar(self, mode: str = "find") -> None:
         self.search_mode = mode

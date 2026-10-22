@@ -338,6 +338,9 @@ class EditMenuBehaviorTests(unittest.TestCase):
     def edit_menu(self):
         return self.window.menuBar().actions()[1].menu()
 
+    def selection_menu(self):
+        return self.window.menuBar().actions()[2].menu()
+
     def submenu(self, parent, label: str):
         return next(action.menu() for action in parent.actions() if action.text() == label)
 
@@ -601,14 +604,212 @@ class EditMenuBehaviorTests(unittest.TestCase):
             self.action(reverse_menu, "Shuffle").trigger()
         self.assertEqual(editor.toPlainText(), "c\nb\na")
 
-    def test_unimplemented_edit_groups_are_explicitly_disabled(self) -> None:
+    def test_soft_undo_and_redo_restore_cursor_positions(self) -> None:
+        editor = self.window.current_editor()
+        editor.setPlainText("abcdef")
+        for position in (2, 4):
+            cursor = editor.textCursor()
+            cursor.setPosition(position)
+            editor.setTextCursor(cursor)
+        undo_selection = self.submenu(self.edit_menu(), "Undo Selection")
+
+        self.action(undo_selection, "Soft Undo").trigger()
+        self.assertEqual(editor.textCursor().position(), 2)
+        self.action(undo_selection, "Soft Redo").trigger()
+        self.assertEqual(editor.textCursor().position(), 4)
+
+    def test_tag_commands_close_expand_and_wrap_tags(self) -> None:
+        editor = self.window.current_editor()
+        tag_menu = self.submenu(self.edit_menu(), "Tag")
+        editor.setPlainText("<strong>hello</strong>")
+        cursor = editor.textCursor()
+        cursor.setPosition(len("<strong>"))
+        editor.setTextCursor(cursor)
+        self.action(tag_menu, "Close Tag").trigger()
+        self.assertEqual(editor.toPlainText(), "<strong></strong>hello</strong>")
+
+        editor.setPlainText("<strong>hello</strong>")
+        cursor = editor.textCursor()
+        cursor.setPosition(len("<strong>he"))
+        editor.setTextCursor(cursor)
+        self.action(tag_menu, "Expand Selection to Tag").trigger()
+        self.assertEqual(editor.textCursor().selectedText(), "<strong>hello</strong>")
+
+        editor.setPlainText("hello")
+        self.select_all(editor)
+        with patch.object(subtext_app.QInputDialog, "getText", return_value=("em", True)):
+            self.action(tag_menu, "Wrap Selection With Tag").trigger()
+        self.assertEqual(editor.toPlainText(), "<em>hello</em>")
+
+    def test_mark_commands_select_delete_swap_and_yank(self) -> None:
+        editor = self.window.current_editor()
+        mark_menu = self.submenu(self.edit_menu(), "Mark")
+        editor.setPlainText("abcdef")
+        cursor = editor.textCursor()
+        cursor.setPosition(1)
+        editor.setTextCursor(cursor)
+        self.action(mark_menu, "Set Mark").trigger()
+        cursor = editor.textCursor()
+        cursor.setPosition(5)
+        editor.setTextCursor(cursor)
+        self.action(mark_menu, "Select to Mark").trigger()
+        self.assertEqual(editor.textCursor().selectedText(), "bcde")
+        self.action(mark_menu, "Swap with Mark").trigger()
+        self.assertEqual(editor.textCursor().position(), 1)
+
+        self.action(mark_menu, "Select to Mark").trigger()
+        self.action(mark_menu, "Delete to Mark").trigger()
+        self.assertEqual(editor.toPlainText(), "af")
+        self.action(mark_menu, "Yank").trigger()
+        self.assertEqual(editor.toPlainText(), "abcdef")
+        self.action(mark_menu, "Clear Mark").trigger()
+        self.assertFalse(self.action(mark_menu, "Select to Mark").isEnabled())
+
+    def test_code_folding_hides_and_restores_indented_blocks(self) -> None:
+        editor = self.window.current_editor()
+        folding = self.submenu(self.edit_menu(), "Code Folding")
+        editor.setPlainText("def sample():\n    first()\n    second()\nnext()")
+        cursor = editor.textCursor()
+        cursor.setPosition(0)
+        editor.setTextCursor(cursor)
+        self.action(folding, "Fold").trigger()
+        self.assertFalse(editor.document().findBlockByNumber(1).isVisible())
+
+        self.action(folding, "Unfold").trigger()
+        self.assertTrue(editor.document().findBlockByNumber(1).isVisible())
+        self.action(folding, "Fold All").trigger()
+        self.assertFalse(editor.document().findBlockByNumber(2).isVisible())
+        self.action(folding, "Unfold All").trigger()
+        self.assertTrue(editor.document().findBlockByNumber(2).isVisible())
+
+    def test_completion_menu_offers_words_and_inserts_the_selection(self) -> None:
+        editor = self.window.current_editor()
+        editor.setPlainText("pri print")
+        cursor = editor.textCursor()
+        cursor.setPosition(3)
+        editor.setTextCursor(cursor)
+        self.action(self.edit_menu(), "Show Completions").trigger()
+        self.assertIsNotNone(self.window.completion_menu)
+        candidate = self.action(self.window.completion_menu, "print")
+        candidate.trigger()
+        self.assertEqual(editor.toPlainText(), "print print")
+
+    def test_permute_selections_and_multi_line_selection_commands(self) -> None:
+        editor = self.window.current_editor()
         edit_menu = self.edit_menu()
-        undo_selection = self.submenu(edit_menu, "Undo Selection")
-        self.assertTrue(all(not action.isEnabled() for action in undo_selection.actions()))
-        for label in ("Tag", "Mark", "Code Folding", "Permute Selections"):
-            with self.subTest(menu=label):
-                self.assertFalse(self.submenu(edit_menu, label).isEnabled())
-        self.assertFalse(self.action(edit_menu, "Show Completions").isEnabled())
+        editor.setPlainText("b\na")
+        self.select_all(editor)
+        permute = self.submenu(edit_menu, "Permute Selections")
+        self.action(permute, "Sort").trigger()
+        self.assertEqual(editor.toPlainText(), "a\nb")
+
+        selection_menu = self.selection_menu()
+        editor.setPlainText("first\nsecond\nthird")
+        editor.selectAll()
+        self.action(selection_menu, "Split into Lines").trigger()
+        self.assertEqual(
+            [editor.toPlainText()[start:end] for start, end in editor.multi_selection_ranges],
+            ["first", "second", "third"],
+        )
+        self.assertTrue(self.action(selection_menu, "Single Selection").isEnabled())
+        self.action(selection_menu, "Single Selection").trigger()
+        self.assertFalse(editor.multi_selection_ranges)
+
+        cursor = editor.textCursor()
+        cursor.setPosition(len("first\nsecond") + 2)
+        editor.setTextCursor(cursor)
+        self.action(selection_menu, "Add Previous Line").trigger()
+        self.assertEqual(len(editor.multi_selection_ranges), 2)
+        self.action(selection_menu, "Single Selection").trigger()
+        cursor = editor.textCursor()
+        cursor.setPosition(2)
+        editor.setTextCursor(cursor)
+        self.action(selection_menu, "Add Next Line").trigger()
+        self.assertEqual(len(editor.multi_selection_ranges), 2)
+
+    def test_expand_selection_to_scope_uses_matching_brackets(self) -> None:
+        editor = self.window.current_editor()
+        editor.setPlainText("call(inner(value))")
+        cursor = editor.textCursor()
+        cursor.setPosition(len("call(in"))
+        editor.setTextCursor(cursor)
+
+        self.action(self.selection_menu(), "Expand Selection to Scope").trigger()
+
+        self.assertEqual(editor.textCursor().selectedText(), "(inner(value))")
+
+    def test_selection_expansion_modes_cover_words_lines_paragraphs_and_indentation(self) -> None:
+        editor = self.window.current_editor()
+        selection = self.selection_menu()
+        editor.setPlainText("alpha beta\nnext")
+        cursor = editor.textCursor()
+        cursor.setPosition(2)
+        editor.setTextCursor(cursor)
+        self.action(selection, "Expand Selection to Word").trigger()
+        self.assertEqual(editor.textCursor().selectedText(), "alpha")
+
+        editor.setPlainText("alpha beta\nnext")
+        cursor = editor.textCursor()
+        cursor.setPosition(2)
+        editor.setTextCursor(cursor)
+        self.action(selection, "Expand Selection to Line").trigger()
+        self.assertEqual(editor.textCursor().selectedText().replace("\u2029", "\n"), "alpha beta\n")
+
+        editor.setPlainText("first\nsecond\nthird")
+        cursor = editor.textCursor()
+        cursor.setPosition(len("first\nse"))
+        editor.setTextCursor(cursor)
+        self.action(selection, "Expand Selection to Line Upward").trigger()
+        self.assertEqual(
+            editor.textCursor().selectedText().replace("\u2029", "\n"), "first\nsecond\n"
+        )
+
+        editor.setPlainText("paragraph one\nparagraph two\n\nnext")
+        cursor = editor.textCursor()
+        cursor.setPosition(5)
+        editor.setTextCursor(cursor)
+        self.action(selection, "Expand Selection to Paragraph").trigger()
+        self.assertEqual(
+            editor.textCursor().selectedText().replace("\u2029", "\n"),
+            "paragraph one\nparagraph two",
+        )
+
+        editor.setPlainText("root\n    child one\n    child two\nend")
+        cursor = editor.textCursor()
+        cursor.setPosition(len("root\n    chi"))
+        editor.setTextCursor(cursor)
+        self.action(selection, "Expand Selection to Indentation").trigger()
+        self.assertEqual(
+            editor.textCursor().selectedText().replace("\u2029", "\n"),
+            "    child one\n    child two\n",
+        )
+
+        editor.setPlainText("before (value) after")
+        cursor = editor.textCursor()
+        cursor.setPosition(len("before (va"))
+        editor.setTextCursor(cursor)
+        self.action(selection, "Expand Selection to Brackets").trigger()
+        self.assertEqual(editor.textCursor().selectedText(), "(value)")
+
+        editor.setPlainText("target target")
+        cursor = editor.textCursor()
+        cursor.setPosition(2)
+        editor.setTextCursor(cursor)
+        self.action(selection, "Expand Selection").trigger()
+        self.assertEqual(editor.textCursor().selectedText(), "target")
+
+    def test_tab_selection_selects_and_focuses_tabs(self) -> None:
+        self.window.new_file()
+        self.window.new_file()
+        self.window.tabs.setCurrentIndex(2)
+        selection = self.submenu(self.selection_menu(), "Tab Selection")
+        self.action(selection, "Select to Left").trigger()
+        selected = self.window.selected_tab_editors
+        self.assertEqual(len(selected), 3)
+        self.action(selection, "Focus Selected Tab 1").trigger()
+        self.assertEqual(self.window.tabs.currentIndex(), 0)
+        self.action(selection, "Unselect Others").trigger()
+        self.assertEqual(self.window.selected_tab_editors, {self.window.tabs.currentWidget()})
 
 
 if __name__ == "__main__":
