@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -13,7 +13,7 @@ _test_home = tempfile.TemporaryDirectory(prefix="subtext-file-menu-tests-")
 os.environ["HOME"] = _test_home.name
 os.environ["XDG_CONFIG_HOME"] = str(Path(_test_home.name) / ".config")
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialog  # noqa: E402
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
@@ -29,7 +29,13 @@ application.setOrganizationName("SubText Tests")
 
 class FileMenuBehaviorTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.temp_home = tempfile.TemporaryDirectory(dir=_test_home.name)
+        self.addCleanup(self.temp_home.cleanup)
+        self.temp_dir = Path(self.temp_home.name)
         self.window = subtext_app.MainWindow([], start_new=True)
+        self.window.settings.clear()
+        self.window.recent_files.clear()
+        self.window.populate_recent_menu()
         self.window.show()
         application.processEvents()
 
@@ -37,12 +43,100 @@ class FileMenuBehaviorTests(unittest.TestCase):
         self.window.close()
         application.processEvents()
 
+    def file_menu(self):
+        return self.window.menuBar().actions()[0].menu()
+
+    def menu_action(self, label: str):
+        return next(action for action in self.file_menu().actions() if action.text() == label)
+
+    def submenu(self, label: str):
+        return next(
+            action.menu()
+            for action in self.file_menu().actions()
+            if action.text() == label
+        )
+
+    def test_new_file_creates_an_untitled_tab(self) -> None:
+        initial_count = self.window.tabs.count()
+
+        self.menu_action("New File").trigger()
+
+        self.assertEqual(self.window.tabs.count(), initial_count + 1)
+        self.assertEqual(self.window.current_editor().property("displayName"), "Untitled 2")
+
+    def test_open_file_action_loads_selected_file(self) -> None:
+        path = self.temp_dir / "opened.txt"
+        path.write_text("opened from File menu", encoding="utf-8")
+
+        with patch.object(
+            subtext_app.QFileDialog,
+            "getOpenFileNames",
+            return_value=([str(path)], "All Files (*)"),
+        ):
+            self.menu_action("Open File…").trigger()
+
+        self.assertEqual(self.window.current_editor().toPlainText(), "opened from File menu")
+        self.assertEqual(Path(self.window.current_editor().property("filePath")), path)
+
+    def test_open_file_uses_windows_1252_fallback_for_legacy_text(self) -> None:
+        path = self.temp_dir / "legacy.txt"
+        path.write_bytes("café".encode("cp1252"))
+
+        with patch.object(
+            subtext_app.QFileDialog,
+            "getOpenFileNames",
+            return_value=([str(path)], "All Files (*)"),
+        ):
+            self.menu_action("Open File…").trigger()
+
+        editor = self.window.current_editor()
+        self.assertEqual(editor.toPlainText(), "café")
+        self.assertEqual(editor.property("fileEncoding"), "cp1252")
+
+    def test_open_folder_action_sets_the_project_root(self) -> None:
+        folder = self.temp_dir / "project"
+        folder.mkdir()
+
+        with patch.object(
+            subtext_app.QFileDialog, "getExistingDirectory", return_value=str(folder)
+        ):
+            self.menu_action("Open Folder…").trigger()
+
+        self.assertEqual(self.window.project_root, folder.resolve())
+        self.assertEqual(self.window.project_folders, [folder.resolve()])
+
+    def test_open_recent_action_reopens_a_recent_file(self) -> None:
+        path = self.temp_dir / "recent.txt"
+        path.write_text("recent content", encoding="utf-8")
+        self.window.remember_recent_file(str(path))
+        self.window.populate_recent_menu()
+
+        self.submenu("Open Recent").actions()[0].trigger()
+
+        self.assertEqual(self.window.current_editor().toPlainText(), "recent content")
+
+    def test_reopen_with_encoding_reads_a_legacy_file(self) -> None:
+        path = self.temp_dir / "latin1.txt"
+        path.write_bytes("café".encode("iso-8859-1"))
+        self.window.open_path(str(path))
+        editor = self.window.current_editor()
+        reopen_action = next(
+            action
+            for action in self.submenu("Reopen with Encoding").actions()
+            if "ISO 8859-1" in action.text()
+        )
+
+        reopen_action.trigger()
+
+        self.assertEqual(editor.toPlainText(), "café")
+        self.assertEqual(editor.property("fileEncoding"), "iso-8859-1")
+
     def test_split_view_shares_the_active_document_and_toggles(self) -> None:
         editor = self.window.current_editor()
         editor.setPlainText("original")
         editor.document().setModified(True)
 
-        self.window.split_view_action.trigger()
+        self.menu_action("Split View").trigger()
         application.processEvents()
 
         self.assertTrue(self.window._split_view_enabled)
@@ -54,42 +148,47 @@ class FileMenuBehaviorTests(unittest.TestCase):
         self.window.split_editor.setPlainText("edited from the split pane")
         self.assertEqual(editor.toPlainText(), "edited from the split pane")
 
-        self.window.split_view_action.trigger()
+        self.menu_action("Split View").trigger()
         self.assertFalse(self.window._split_view_enabled)
         self.assertTrue(self.window.split_editor.isHidden())
+
+    def test_save_action_writes_the_current_file(self) -> None:
+        path = self.temp_dir / "saved.txt"
+        editor = self.window.current_editor()
+        editor.setProperty("filePath", str(path))
+        editor.setProperty("displayName", path.name)
+        editor.setPlainText("saved content")
+        editor.document().setModified(True)
+
+        self.menu_action("Save").trigger()
+
+        self.assertEqual(path.read_text(encoding="utf-8"), "saved content")
+        self.assertFalse(editor.document().isModified())
 
     def test_save_as_suggests_the_untitled_text_as_filename(self) -> None:
         editor = self.window.current_editor()
         editor.setPlainText("Meeting notes\nsecond line")
         editor.document().setModified(True)
-        output_path = Path(_test_home.name) / "Meeting notes"
+        output_path = self.temp_dir / "Meeting notes"
 
         with patch.object(
             subtext_app.QFileDialog,
             "getSaveFileName",
             return_value=(str(output_path), "All Files (*)"),
         ) as save_dialog:
-            self.window.action_save_as.trigger()
+            self.menu_action("Save As…").trigger()
 
-        self.assertEqual(
-            save_dialog.call_args.args[2],
-            str(Path(_test_home.name) / "Meeting notes"),
-        )
+        self.assertEqual(save_dialog.call_args.args[2], str(self.window.project_root / "Meeting notes"))
         self.assertEqual(output_path.read_text(encoding="utf-8"), "Meeting notes\nsecond line")
 
     def test_save_with_encoding_writes_bytes_using_selected_codec(self) -> None:
         editor = self.window.current_editor()
         editor.setPlainText("café €")
         editor.document().setModified(True)
-        output_path = Path(_test_home.name) / "encoding-check.txt"
-        file_menu = self.window.menuBar().actions()[0].menu()
-        encoding_menu = next(
-            action.menu()
-            for action in file_menu.actions()
-            if action.text() == "Save with Encoding"
-        )
+        output_path = self.temp_dir / "encoding-check.txt"
+        save_encoding_menu = self.submenu("Save with Encoding")
         windows_1252 = next(
-            action for action in encoding_menu.actions() if "1252" in action.text()
+            action for action in save_encoding_menu.actions() if "1252" in action.text()
         )
 
         with patch.object(
@@ -113,11 +212,113 @@ class FileMenuBehaviorTests(unittest.TestCase):
             "getSaveFileName",
             return_value=("", "All Files (*)"),
         ):
-            self.window.save_with_encoding("cp1252")
+            self.submenu("Save with Encoding").actions()[3].trigger()
 
         self.assertEqual(editor.property("fileEncoding"), "utf-8")
         self.assertTrue(editor.document().isModified())
         self.assertFalse(editor.property("filePath"))
+
+    def test_save_all_writes_every_modified_named_tab(self) -> None:
+        first_path = self.temp_dir / "first.txt"
+        second_path = self.temp_dir / "second.txt"
+        first = self.window.current_editor()
+        first.setProperty("filePath", str(first_path))
+        first.setPlainText("first")
+        first.document().setModified(True)
+        second = self.window.create_editor(second_path.name)
+        second.setProperty("filePath", str(second_path))
+        second.setPlainText("second")
+        second.document().setModified(True)
+
+        self.menu_action("Save All").trigger()
+
+        self.assertEqual(first_path.read_text(encoding="utf-8"), "first")
+        self.assertEqual(second_path.read_text(encoding="utf-8"), "second")
+        self.assertFalse(first.document().isModified())
+        self.assertFalse(second.document().isModified())
+
+    def test_print_action_opens_dialog_and_prints_when_accepted(self) -> None:
+        dialog = Mock()
+        dialog.exec.return_value = QDialog.DialogCode.Accepted
+        with (
+            patch.object(subtext_app, "QPrintDialog", return_value=dialog),
+            patch.object(subtext_app.CodeEditor, "print_", autospec=True) as print_mock,
+        ):
+            self.menu_action("Print…").trigger()
+
+        dialog.exec.assert_called_once_with()
+        print_mock.assert_called_once()
+
+    def test_new_window_action_creates_another_window(self) -> None:
+        previous = set(getattr(application, "_subtext_windows", []))
+
+        self.menu_action("New Window").trigger()
+        application.processEvents()
+
+        new_windows = [
+            window
+            for window in getattr(application, "_subtext_windows", [])
+            if window not in previous
+        ]
+        self.assertEqual(len(new_windows), 1)
+        self.assertTrue(new_windows[0].isVisible())
+        new_windows[0].close()
+
+    def test_close_window_action_closes_the_window(self) -> None:
+        self.menu_action("Close Window").trigger()
+
+        self.assertFalse(self.window.isVisible())
+
+    def test_close_file_action_closes_the_active_tab(self) -> None:
+        self.menu_action("Close File").trigger()
+
+        self.assertEqual(self.window.tabs.count(), 1)
+        self.assertEqual(self.window.current_editor().property("displayName"), "Untitled")
+
+    def test_close_file_cancel_keeps_modified_tab_open(self) -> None:
+        editor = self.window.current_editor()
+        editor.setPlainText("unsaved")
+        editor.document().setModified(True)
+        with patch.object(
+            subtext_app.QMessageBox,
+            "question",
+            return_value=subtext_app.QMessageBox.StandardButton.Cancel,
+        ) as question:
+            self.menu_action("Close File").trigger()
+
+        question.assert_called_once()
+        self.assertEqual(self.window.tabs.count(), 1)
+        self.assertIs(self.window.current_editor(), editor)
+
+    def test_revert_file_restores_saved_contents(self) -> None:
+        path = self.temp_dir / "revert.txt"
+        path.write_text("disk contents", encoding="utf-8")
+        self.window.open_path(str(path))
+        editor = self.window.current_editor()
+        editor.setPlainText("unsaved changes")
+        editor.document().setModified(True)
+        with patch.object(
+            subtext_app.QMessageBox,
+            "question",
+            return_value=subtext_app.QMessageBox.StandardButton.Yes,
+        ):
+            self.menu_action("Revert File").trigger()
+
+        self.assertEqual(editor.toPlainText(), "disk contents")
+        self.assertFalse(editor.document().isModified())
+
+    def test_close_all_files_closes_every_tab(self) -> None:
+        self.window.new_file()
+        self.assertEqual(self.window.tabs.count(), 2)
+
+        self.menu_action("Close All Files").trigger()
+
+        self.assertEqual(self.window.tabs.count(), 0)
+
+    def test_quit_action_closes_all_windows(self) -> None:
+        self.menu_action("Quit").trigger()
+
+        self.assertFalse(self.window.isVisible())
 
 
 if __name__ == "__main__":

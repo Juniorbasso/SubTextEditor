@@ -3106,7 +3106,15 @@ class MainWindow(QMainWindow):
                 self.remember_recent_file(str(file_path))
                 return
         try:
-            raw_content = file_path.read_bytes().decode("utf-8")
+            raw_content_bytes = file_path.read_bytes()
+            try:
+                raw_content = raw_content_bytes.decode("utf-8")
+                file_encoding = "utf-8"
+            except UnicodeDecodeError:
+                # Sublime's default fallback is Western (Windows 1252). Keep
+                # legacy files openable so Reopen with Encoding can be used.
+                raw_content = raw_content_bytes.decode("cp1252")
+                file_encoding = "cp1252"
         except (OSError, UnicodeError) as error:
             QMessageBox.critical(self, "Cannot Open File", str(error))
             return
@@ -3114,7 +3122,7 @@ class MainWindow(QMainWindow):
         content = raw_content.replace("\r\n", "\n").replace("\r", "\n")
         editor = self.create_editor(file_path.name)
         editor.setProperty("filePath", str(file_path))
-        editor.setProperty("fileEncoding", "utf-8")
+        editor.setProperty("fileEncoding", file_encoding)
         editor.setProperty("lineEnding", line_ending)
         editor.setPlainText(content)
         editor.document().setModified(False)
